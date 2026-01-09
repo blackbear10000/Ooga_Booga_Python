@@ -1,13 +1,14 @@
 from typing import List
 import aiohttp
 import asyncio
+import os
 from eth_typing import HexStr
 from web3 import Web3
 from web3.constants import MAX_INT, ADDRESS_ZERO
 from web3.types import TxParams
 
 from custom_logger import get_logger
-from constants import BASE_URL, CHAIN_ID
+from constants import BASE_URL, CHAIN_ID, ERC20_ABI
 from exceptions import APIRequestError, APINotFoundError, APIRateLimitError, APIServerError
 from models import (
     SwapParams,
@@ -66,6 +67,12 @@ class OogaBoogaClient:
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
         self.account = self.w3.eth.account.from_key(private_key)
         self.address = self.account.address
+
+        # Get router address from environment variable
+        router_address = os.getenv("ROUTER_ADDRESS")
+        if not router_address:
+            raise ValueError("ROUTER_ADDRESS environment variable is required.")
+        self.router_address = Web3.to_checksum_address(router_address)
 
 
     async def _send_request(self, url: str, params: dict = None) -> dict:
@@ -220,14 +227,27 @@ class OogaBoogaClient:
             amount (str, optional): The amount to approve. Defaults to MAX_INT.
             custom_nonce (int, optional): Custom nonce for transaction ordering.
         """
-        url = f"{self.base_url}/approve"
-        params = {"token": token, "amount": amount}
-        response_data = await self._send_request(url, params)
-        approve_tx = ApproveResponse(**response_data).tx
-        tx_params = await self._build_transaction(to=approve_tx.to, data=approve_tx.data, custom_nonce=custom_nonce)
-
+        token_address = Web3.to_checksum_address(token)
+        amount_int = int(amount)
+        
+        # Build approve transaction directly
+        contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+        approve_function = contract.functions.approve(self.router_address, amount_int)
+        
+        # Build transaction
+        nonce = custom_nonce or self.w3.eth.get_transaction_count(self.address)
+        tx_dict = approve_function.build_transaction({
+            "from": self.address,
+            "nonce": nonce,
+            "gasPrice": self.w3.eth.gas_price,
+            "chainId": CHAIN_ID,
+        })
+        
+        # Estimate gas
+        tx_dict["gas"] = self.w3.eth.estimate_gas(tx_dict)
+        
         logger.info(f"Approving token {token} with amount {amount}...")
-        await self._prepare_and_send_transaction(tx_params)
+        await self._prepare_and_send_transaction(tx_dict)
 
 
     async def get_token_allowance(self, from_address: str, token: str) -> AllowanceResponse:
@@ -245,10 +265,14 @@ class OogaBoogaClient:
         if token == ADDRESS_ZERO:
             return AllowanceResponse(allowance=str(MAX_INT))
 
-        url = f"{self.base_url}/approve/allowance"
-        params = {"from": from_address, "token": token}
-        response_data = await self._send_request(url, params)
-        return AllowanceResponse(**response_data)
+        # Directly call ERC20 contract's allowance method
+        token_address = Web3.to_checksum_address(token)
+        owner_address = Web3.to_checksum_address(from_address)
+        
+        contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+        allowance = contract.functions.allowance(owner_address, self.router_address).call()
+        
+        return AllowanceResponse(allowance=str(allowance))
 
 
     async def get_token_prices(self) -> List[PriceInfo]:
